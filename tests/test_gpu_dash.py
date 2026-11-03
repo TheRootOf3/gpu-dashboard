@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import zipfile
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +51,21 @@ class Base(unittest.TestCase):
         self.store.con.close()
         self.env.stop()
         self.tmp.cleanup()
+
+    def check_zip(self, path, gpu_rows, proc_rows):
+        """The export zip holds the database and one CSV per table, and they agree."""
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            self.assertEqual(len(names), 1 + len(gpu_dash.CSV_EXPORTS))
+            db_name = next(n for n in names if n.endswith(".sqlite"))
+            z.extract(db_name, self.tmp.name)
+            csvs = {n.split("_")[0]: z.read(n).decode() for n in names if n.endswith(".csv")}
+        copy = sqlite3.connect(os.path.join(self.tmp.name, db_name))
+        self.assertEqual(copy.execute("SELECT COUNT(*) FROM gpu").fetchone()[0], gpu_rows)
+        copy.close()
+        self.assertEqual(set(csvs), {"gpu-samples", "process-samples", "logger-events"})
+        self.assertEqual(len(csvs["gpu-samples"].splitlines()), gpu_rows + 1)
+        self.assertEqual(len(csvs["process-samples"].splitlines()), proc_rows + 1)
 
     def fill(self, minutes, gpus_at):
         """Insert one sample per minute for the last `minutes` minutes."""
@@ -250,16 +266,12 @@ class Exports(Base):
         text = b"".join(self.store.iter_csv("proc")).decode()
         self.assertEqual(text.strip(), ",".join(gpu_dash.CSV_EXPORTS["proc"][1]))
 
-    def test_export_all_copies_database_and_csvs(self):
-        self.fill(10, lambda i: [gpu(0, procs=[proc("alice", 100)])])
-        out = os.path.join(self.tmp.name, "export")
-        paths = gpu_dash.export_all(self.store, "node", out)
-        self.assertEqual(len(paths), 1 + len(gpu_dash.CSV_EXPORTS))
-        copy = sqlite3.connect(paths[0])
-        self.assertEqual(copy.execute("SELECT COUNT(*) FROM gpu").fetchone()[0], 10)
-        copy.close()
-        with open(paths[2]) as f:
-            self.assertEqual(len(f.readlines()), 11)
+    def test_export_all_writes_one_zip(self):
+        self.fill(10, lambda i: [gpu(0, procs=[proc("alice", 100)]), gpu(1)])
+        paths = gpu_dash.export_all(self.store, "node", os.path.join(self.tmp.name, "export"))
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(paths[0].endswith(".zip"))
+        self.check_zip(paths[0], gpu_rows=20, proc_rows=10)
 
 
 class WebAndCli(Base):
@@ -292,6 +304,13 @@ class WebAndCli(Base):
             _, headers, body = get("export/usage.sqlite")
             self.assertTrue(body.startswith(b"SQLite format 3"))
             self.assertEqual(int(headers["Content-Length"]), len(body))
+            _, headers, body = get("export/all.zip")
+            self.assertEqual(headers["Content-Type"], "application/zip")
+            self.assertIn(".zip", headers["Content-Disposition"])
+            zpath = os.path.join(self.tmp.name, "all.zip")
+            with open(zpath, "wb") as f:
+                f.write(body)
+            self.check_zip(zpath, gpu_rows=3, proc_rows=1)
         finally:
             server.shutdown()
             server.server_close()
@@ -311,7 +330,9 @@ class WebAndCli(Base):
         self.assertEqual(out.getvalue().strip(), ",".join(gpu_dash.SUMMARY_HEADER))
         with contextlib.redirect_stdout(io.StringIO()):
             gpu_dash.main(["--data-dir", data_dir, "--export", os.path.join(self.tmp.name, "out")])
-        self.assertEqual(len(os.listdir(os.path.join(self.tmp.name, "out"))), 1 + len(gpu_dash.CSV_EXPORTS))
+        exported = os.listdir(os.path.join(self.tmp.name, "out"))
+        self.assertEqual(len(exported), 1)
+        self.assertTrue(exported[0].startswith("gpu-usage-export_") and exported[0].endswith(".zip"))
 
     def test_second_copy_exits_when_one_is_running(self):
         data_dir = os.path.join(self.tmp.name, "dd")

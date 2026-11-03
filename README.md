@@ -97,7 +97,7 @@ export GPU_DASH_DIR=/path/to/scratch/gpu-dash
 | `gpu_dash.py` | Records a sample every 60 s and serves the dashboard on `127.0.0.1:8050` |
 | `gpu_dash.py --report 7d` | Prints the per-user summary, utilization per GPU and period, and logger uptime, for `24h`, `7d`, `30d` or `90d` |
 | `gpu_dash.py --report 30d --csv` | Prints the per-user summary as CSV |
-| `gpu_dash.py --export DIR` | Writes a copy of the database and every sample and event as CSV into `DIR` |
+| `gpu_dash.py --export DIR` | Writes the same zip as **Download all data** into `DIR` |
 
 Options: `--data-dir DIR` (default `$GPU_DASH_DIR`, otherwise `~/.gpu-dash`), `--port`
 (default 8050), `--host` (default 127.0.0.1), `--interval` (seconds between samples,
@@ -105,7 +105,8 @@ default 60).
 
 ## Exporting data
 
-The **Data** section of the page, and `--export`, give you:
+**Download all data (.zip)** in the **Data** section of the page, and `--export DIR` on
+the command line, both produce `gpu-usage-export_<host>_<date>.zip`. It contains:
 
 | File | Contents |
 |---|---|
@@ -113,11 +114,16 @@ The **Data** section of the page, and `--export`, give you:
 | `gpu-samples_<host>_<date>.csv` | One row per GPU per sample: `time, unix_time, gpu, util_pct, mem_used_mib, mem_total_mib, power_w, temp_c, sample_seconds` |
 | `process-samples_<host>_<date>.csv` | One row per GPU process per sample: `time, unix_time, gpu, user, pid, mem_mib, sm_util_pct` |
 | `logger-events_<host>_<date>.csv` | Logger starts (with the node's boot time) and failed samples: `time, unix_time, event, detail` |
-| `user-summary-<range>_<host>_<date>.csv` | The per-user table for the selected range (the **CSV** button above the table) |
 
-The same files are available directly at `/export/usage.sqlite`, `/export/gpu.csv`,
-`/export/proc.csv`, `/export/events.csv` and `/export/summary.csv?range=7d`. Times in the
-CSV files are in the node's local time.
+The CSV files are read from the same database copy, so everything in the zip agrees.
+Times in them are the node's local time.
+
+The **CSV** button above the per-user table downloads just that table for the selected
+range (`user-summary-<range>_<host>_<date>.csv`).
+
+For scripts, each file is also available on its own: `/export/usage.sqlite`,
+`/export/gpu.csv`, `/export/proc.csv`, `/export/events.csv` and
+`/export/summary.csv?range=7d`. The whole zip is at `/export/all.zip`.
 
 ## Utilization of theoretical maximum
 

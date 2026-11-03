@@ -13,6 +13,7 @@ per data directory - extra copies exit at once - so it is safe to (re)start it f
 own crontab every few minutes as a watchdog. See README.md.
 """
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import fcntl
@@ -27,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -308,24 +310,28 @@ class Store:
             dst.close()
 
     def iter_csv(self, table, batch=50000):
-        """Every row of a table as CSV, in chunks, without blocking the logger for long."""
-        sql, header, _ = CSV_EXPORTS[table]
-        buf = io.StringIO()
-        w = csv.writer(buf, lineterminator="\n")
-        w.writerow(header)
-        last = 0
-        while True:
-            with self.lock:
-                rows = self.con.execute(sql, (last, batch)).fetchall()
-            if not rows:
-                break
-            last = rows[-1][0]
-            w.writerows(r[1:] for r in rows)
-            yield buf.getvalue().encode()
-            buf.seek(0)
-            buf.truncate()
-        if buf.tell():
-            yield buf.getvalue().encode()
+        return iter_csv(self.con, table, self.lock, batch)
+
+
+def iter_csv(con, table, lock=None, batch=50000):
+    """Every row of a table as CSV, in chunks, without blocking the logger for long."""
+    sql, header, _ = CSV_EXPORTS[table]
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(header)
+    last = 0
+    while True:
+        with lock or contextlib.nullcontext():
+            rows = con.execute(sql, (last, batch)).fetchall()
+        if not rows:
+            break
+        last = rows[-1][0]
+        w.writerows(r[1:] for r in rows)
+        yield buf.getvalue().encode()
+        buf.seek(0)
+        buf.truncate()
+    if buf.tell():
+        yield buf.getvalue().encode()
 
 
 # --------------------------------------------------------------------------- app
@@ -659,18 +665,36 @@ def print_report(d):
           % (db["path"], fmt_bytes(db["bytes"]), db["gpu_rows"], db["proc_rows"]))
 
 
+def export_name(host):
+    return "gpu-usage-export_%s_%s.zip" % (host, time.strftime("%Y%m%d"))
+
+
+def write_export_zip(store, host, dest):
+    """All data in one zip: a copy of the database plus every table as CSV. The CSVs are read
+    from that same copy, so the files agree with each other while logging carries on."""
+    stem = "%s_%s" % (host, time.strftime("%Y%m%d"))
+    fd, snap = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    try:
+        store.backup(snap)
+        con = sqlite3.connect("file:%s?mode=ro" % snap, uri=True)
+        try:
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+                z.write(snap, "gpu-usage_%s.sqlite" % stem)
+                for table, (_, _, name) in CSV_EXPORTS.items():
+                    with z.open("%s_%s.csv" % (name, stem), "w", force_zip64=True) as f:
+                        for chunk in iter_csv(con, table):
+                            f.write(chunk)
+        finally:
+            con.close()
+    finally:
+        os.unlink(snap)
+    return dest
+
+
 def export_all(store, host, outdir):
     os.makedirs(outdir, exist_ok=True)
-    stem = "%s_%s" % (host, time.strftime("%Y%m%d"))
-    paths = [os.path.join(outdir, "gpu-usage_%s.sqlite" % stem)]
-    store.backup(paths[0])
-    for table, (_, _, name) in CSV_EXPORTS.items():
-        path = os.path.join(outdir, "%s_%s.csv" % (name, stem))
-        with open(path, "wb") as f:
-            for chunk in store.iter_csv(table):
-                f.write(chunk)
-        paths.append(path)
-    return paths
+    return [write_export_zip(store, host, os.path.join(outdir, export_name(host)))]
 
 
 # --------------------------------------------------------------------------- web
@@ -706,6 +730,16 @@ def make_handler(app):
                 elif p.endswith("/api/history"):
                     d = app.history(q.get("range", ["7d"])[0])
                     self._send(200, json.dumps(d).encode(), "application/json")
+                elif p.endswith("/export/all.zip"):
+                    fd, tmp = tempfile.mkstemp(suffix=".zip")
+                    os.close(fd)
+                    try:
+                        write_export_zip(app.store, app.host, tmp)
+                        with open(tmp, "rb") as f:
+                            self._download(iter(lambda: f.read(1 << 20), b""), "application/zip",
+                                           export_name(app.host), os.path.getsize(tmp))
+                    finally:
+                        os.unlink(tmp)
                 elif p.endswith("/export/usage.sqlite"):
                     fd, tmp = tempfile.mkstemp(suffix=".sqlite")
                     os.close(fd)
@@ -1044,10 +1078,7 @@ footer { color:var(--muted); font-size:12px; margin-top:24px; }
   <div class="card">
     <div class="dstats" id="dbstats"></div>
     <div class="dl">
-      <a class="btn" href="export/usage.sqlite" download><span class="ar">↓</span>Database (.sqlite)</a>
-      <a class="btn" href="export/gpu.csv" download><span class="ar">↓</span>GPU samples (.csv)</a>
-      <a class="btn" href="export/proc.csv" download><span class="ar">↓</span>Process samples (.csv)</a>
-      <a class="btn" href="export/events.csv" download><span class="ar">↓</span>Logger events (.csv)</a>
+      <a class="btn" id="zipbtn" href="export/all.zip" download><span class="ar">↓</span><span>Download all data (.zip)</span></a>
     </div>
     <div class="note" id="dbnote"></div>
   </div>
@@ -1521,7 +1552,8 @@ function renderData(d) {
     stat("Process samples", db.proc_rows.toLocaleString(), `${db.users} users seen`),
     stat("Logging since", db.first != null ? fmtT(db.first, YEAR) : "–", db.first != null ? `${days < 1 ? "<1" : Math.round(days)} days of data` : null));
   const note = $("#dbnote"); note.textContent = "";
-  note.append("Stored in ", el("code", null, db.path), ". Downloads contain everything logged so far; times in CSV files are the node's local time.");
+  note.append("Stored in ", el("code", null, db.path), ". The zip holds a copy of this database plus every GPU sample, " +
+              "process sample and logger event as CSV files (times in the node's local time).");
 }
 
 // ---- utilization as a share of the theoretical maximum, every GPU x every range
@@ -1654,6 +1686,12 @@ for (const b of document.querySelectorAll(".seg button")) {
     loadHist();
   });
 }
+// building the zip takes a few seconds on a large database, so say so until the download starts
+$("#zipbtn").addEventListener("click", () => {
+  const label = $("#zipbtn span:last-child");
+  label.textContent = "Preparing download…";
+  setTimeout(() => { label.textContent = "Download all data (.zip)"; }, 10000);
+});
 let rt;
 addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (hist) { renderCols(hist); renderTimeline(hist); renderMetrics(hist); renderUptime(hist); } }, 150); });
 loadLive(); loadHist();
