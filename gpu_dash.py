@@ -39,11 +39,13 @@ SCHEMA_VERSION = 3
 
 # range -> (timeline bin seconds, column bucket, number of columns)
 RANGES = {
+    "4h": (120, "15min", 16),
     "24h": (600, "hour", 24),
     "7d": (3600, "day", 7),
     "30d": (4 * 3600, "day", 30),
     "90d": (12 * 3600, "day", 90),
 }
+BUCKET_SECONDS = {"15min": 900, "hour": 3600, "day": 86400}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS gpu   (ts INTEGER, dt REAL, gpu INTEGER, util REAL, mem_used REAL,
@@ -405,7 +407,8 @@ class App:
         now = time.time() if now is None else now
         starts, fmt = range_window(rng, now)
         since, end = int(starts[0].timestamp()), int(starts[-1].timestamp())
-        keys = [s.strftime(fmt) for s in starts[:-1]]
+        # hour and day columns follow the local calendar; 15-minute columns are counted from `since`
+        keys = [s.strftime(fmt) for s in starts[:-1]] if fmt else list(range(len(starts) - 1))
         nbins = -(-(end - since) // bin_s)
         windows = {r: int(range_window(r, now)[0][0].timestamp()) for r in RANGES}
 
@@ -441,9 +444,13 @@ class App:
                        SUM(CASE WHEN k > 1 THEN dt ELSE 0 END) / SUM(dt)
                 FROM s GROUP BY user ORDER BY 2 DESC""", (IDLE_UTIL,)).fetchall()
             shared_sec = c.execute("SELECT SUM(sec) FROM s WHERE k > 1").fetchone()[0] or 0
-            per_bucket = c.execute(
-                "SELECT strftime(?, ts, 'unixepoch', 'localtime'), user, SUM(sec) "
-                "FROM s GROUP BY 1, 2", (fmt,)).fetchall()
+            if fmt:
+                per_bucket = c.execute(
+                    "SELECT strftime(?, ts, 'unixepoch', 'localtime'), user, SUM(sec) "
+                    "FROM s GROUP BY 1, 2", (fmt,)).fetchall()
+            else:
+                per_bucket = c.execute("SELECT (ts - ?) / ?, user, SUM(sec) FROM s GROUP BY 1, 2",
+                                       (since, BUCKET_SECONDS[kind])).fetchall()
             tl_users = c.execute(
                 "SELECT gpu, (ts - ?) / ?, user, SUM(sec) FROM s GROUP BY 1, 2, 3",
                 (since, bin_s)).fetchall()
@@ -500,7 +507,8 @@ class App:
         return {
             "range": rng, "kind": kind, "since": since, "end": end, "now": int(now),
             "tz_offset": time.localtime(now).tm_gmtoff, "bin": bin_s,
-            "bucket_hours": 1 if kind == "hour" else 24, "n_gpus": len(gpu_ids) or 1,
+            "bucket_s": BUCKET_SECONDS[kind], "bucket_hours": BUCKET_SECONDS[kind] / 3600,
+            "n_gpus": len(gpu_ids) or 1,
             "interval": self.interval, "idle_util": IDLE_UTIL,
             "kpi": {"used_h": sum(u[1] for u in users) / 3600, "sampled_h": sampled / 3600,
                     "idle_h": sum(u[2] for u in users) / 3600, "shared_h": shared_sec / 3600,
@@ -524,6 +532,10 @@ def range_window(rng, now):
     """Local-time bucket starts for a range (ending with the end of the current bucket)."""
     _, kind, n = RANGES[rng]
     local_now = dt.datetime.fromtimestamp(now)
+    if kind == "15min":
+        first = local_now.replace(minute=local_now.minute - local_now.minute % 15, second=0,
+                                  microsecond=0) - dt.timedelta(minutes=15 * (n - 1))
+        return [first + dt.timedelta(minutes=15 * i) for i in range(n + 1)], None
     if kind == "hour":
         first = local_now.replace(minute=0, second=0, microsecond=0) - dt.timedelta(hours=n - 1)
         return [first + dt.timedelta(hours=i) for i in range(n + 1)], "%Y-%m-%d %H"
@@ -650,11 +662,9 @@ def print_report(d):
         print("(no GPU use recorded in this period)")
 
     p = d["periods"]
-    print("\nutilization as % of the theoretical maximum (over logged time)")
-    print("%-10s" % "" + "".join("%9s" % r for r in p["ranges"]))
-    for name, g in [("GPU %d" % g["index"], g) for g in p["gpus"]] + [("all GPUs", p["all"])]:
-        print("%-10s" % name + "".join("%9s" % ("-" if g["util"][r] is None else "%.0f%%" % g["util"][r])
-                                       for r in p["ranges"]))
+    a = p["all"]
+    print("\nutilization of the theoretical maximum, all GPUs (over logged time): " + ", ".join(
+        "%s %s" % (r, "-" if a["util"][r] is None else "%.0f%%" % a["util"][r]) for r in p["ranges"]))
 
     u = d["uptime"]
     if u["pct"] is not None:
@@ -893,7 +903,20 @@ h4 { font-size:13px; font-weight:600; margin:0; }
 code { font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
 header, .sec-h { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:8px 16px; }
 .sec-h { align-items:center; margin:28px 0 12px; }
-.sec-h h2 span { color:var(--ink2); font-weight:400; margin-left:6px; }
+.sec-h h2 { display:flex; align-items:baseline; flex-wrap:wrap; }
+.sec-h h2 > span { color:var(--ink2); font-weight:400; margin-left:6px; }
+
+/* folding: a button in each heading hides the section's or card's .fold */
+.tog { font:inherit; color:inherit; background:none; border:0; padding:0; margin:0; cursor:pointer;
+       display:inline-flex; align-items:center; gap:8px; text-align:left; border-radius:4px; }
+.tog:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.tog .chev { width:7px; height:7px; flex:none; border-right:1.5px solid var(--ink2); border-bottom:1.5px solid var(--ink2);
+             transform:translateY(-2px) rotate(45deg); transition:transform .15s; }
+.collapsed > .sec-h .tog .chev, .card.collapsed .tog .chev { transform:rotate(-45deg); }
+[data-fold].collapsed > .fold { display:none; }
+section.collapsed > .sec-h .seg { display:none; }
+.card.collapsed > .ch { margin-bottom:0; }
+.card.collapsed > .ch .legend, .card.collapsed > .ch .btn, .card.collapsed > .ch .desc { display:none; }
 .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px; min-width:0; }
 .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
 .stack { display:grid; gap:12px; }
@@ -931,6 +954,11 @@ header, .sec-h { display:flex; flex-wrap:wrap; align-items:baseline; justify-con
               padding:5px 12px; border-radius:6px; cursor:pointer; }
 .seg button:hover { background:var(--wash); }
 .seg button[aria-pressed="true"] { background:var(--ink); color:var(--surface); font-weight:600; }
+.seg button { white-space:nowrap; }
+@media (max-width: 520px) {
+  .seg { width:100%; }
+  .seg button { flex:1; padding:5px 2px; font-size:12px; }
+}
 
 /* stat tiles */
 .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
@@ -983,13 +1011,8 @@ td .sw { margin-right:8px; vertical-align:-1px; }
 td.wrap { white-space:normal; min-width:240px; color:var(--ink2); }
 
 /* utilization of theoretical maximum */
-.ptable td.num { min-width:110px; }
-.ptable .pv { font-weight:600; font-size:15px; }
-.ptable .pbar { display:block; height:4px; border-radius:2px; background:var(--accent-track); margin-top:5px; overflow:hidden; }
-.ptable .pbar span { display:block; height:100%; background:var(--accent); border-radius:2px; }
-.ptable .pl2 { display:block; font-size:11px; color:var(--muted); margin-top:3px; }
-.ptable tr.all td { font-weight:600; border-bottom:0; }
-.ptable tr.all td:first-child { color:var(--ink); }
+.tile .pbar { display:block; height:6px; border-radius:3px; background:var(--accent-track); margin:8px 0 6px; overflow:hidden; }
+.tile .pbar span { display:block; height:100%; background:var(--accent); border-radius:3px; }
 
 /* logger uptime */
 .upseg { fill:var(--good); }
@@ -1032,63 +1055,76 @@ footer { color:var(--muted); font-size:12px; margin-top:24px; }
   </header>
   <div class="card" id="err"></div>
 
-  <div class="sec-h"><h2>Right now<span id="freecount"></span></h2></div>
-  <div class="cards" id="live"></div>
+  <!-- every section and chart card folds away; [data-fold] names it for the remembered state -->
+  <section data-fold="now">
+    <div class="sec-h"><h2><button class="tog" aria-expanded="true"><span class="chev"></span>Right now</button><span id="freecount"></span></h2></div>
+    <div class="fold"><div class="cards" id="live"></div></div>
+  </section>
 
-  <div class="sec-h"><h2>Utilization of theoretical maximum</h2></div>
-  <div class="card hist">
-    <div class="tablewrap"><table id="periods" class="ptable"></table></div>
-    <div class="note" id="pnote"></div>
-  </div>
+  <section data-fold="max">
+    <div class="sec-h"><h2><button class="tog" aria-expanded="true"><span class="chev"></span>Utilization of theoretical maximum</button><span id="maxsub"></span></h2></div>
+    <div class="fold hist">
+      <div class="tiles" id="periods"></div>
+      <div class="note" id="pnote"></div>
+    </div>
+  </section>
 
-  <div class="sec-h">
-    <h2>History</h2>
-    <div class="seg" role="group" aria-label="Time range">
-      <button data-r="24h">24 hours</button><button data-r="7d">7 days</button><button data-r="30d">30 days</button><button data-r="90d">90 days</button>
+  <section data-fold="history">
+    <div class="sec-h">
+      <h2><button class="tog" aria-expanded="true"><span class="chev"></span>History</button></h2>
+      <div class="seg" role="group" aria-label="Time range">
+        <button data-r="4h">4 hours</button><button data-r="24h">24 hours</button><button data-r="7d">7 days</button><button data-r="30d">30 days</button><button data-r="90d">90 days</button>
+      </div>
     </div>
-  </div>
-  <div class="stack hist">
-    <div class="tiles" id="kpis"></div>
-    <div class="card">
-      <div class="ch"><h3 id="cols-title">GPU-hours by user</h3><div class="legend"></div></div>
-      <div id="cols"></div>
+    <div class="fold stack hist">
+      <div class="tiles" id="kpis"></div>
+      <div class="card" data-fold="cols">
+        <div class="ch"><h3><button class="tog" aria-expanded="true"><span class="chev"></span><span id="cols-title">GPU-hours by user</span></button></h3><div class="legend"></div></div>
+        <div class="fold"><div id="cols"></div></div>
+      </div>
+      <div class="card" data-fold="timeline">
+        <div class="ch"><div><h3><button class="tog" aria-expanded="true"><span class="chev"></span>Who held each GPU</button></h3><div class="sub small desc">Bar height is how much of the time the GPU was in use; colours show who held it, split by GPU memory when shared</div></div><div class="legend"></div></div>
+        <div class="fold"><div id="timeline"></div></div>
+      </div>
+      <div class="card" data-fold="metrics">
+        <div class="ch"><div><h3><button class="tog" aria-expanded="true"><span class="chev"></span>Utilization, memory and power per GPU</button></h3><div class="sub small desc">Average per time slot; hover to compare the GPUs at the same moment</div></div></div>
+        <div class="fold"><div id="metrics"></div></div>
+      </div>
+      <div class="card" data-fold="users">
+        <div class="ch"><h3><button class="tog" aria-expanded="true"><span class="chev"></span>Per-user summary</button></h3><a class="btn" id="sumcsv" href="export/summary.csv" download><span class="ar">↓</span>CSV</a></div>
+        <div class="fold">
+          <div class="tablewrap"><table id="usertable"></table></div>
+          <div class="note" id="tnote"></div>
+        </div>
+      </div>
+      <div class="card" data-fold="uptime">
+        <div class="ch"><div><h3><button class="tog" aria-expanded="true"><span class="chev"></span>Logger uptime</button></h3><div class="sub small" id="uptime-stat"></div></div><div class="legend" id="uptime-legend"></div></div>
+        <div class="fold">
+          <div id="uptime"></div>
+          <div class="tablewrap"><table id="outages"></table></div>
+          <div class="note" id="outnote"></div>
+        </div>
+      </div>
     </div>
-    <div class="card">
-      <div class="ch"><div><h3>Who held each GPU</h3><div class="sub small">Bar height is how much of the time the GPU was in use; colours show who held it, split by GPU memory when shared</div></div><div class="legend"></div></div>
-      <div id="timeline"></div>
-    </div>
-    <div class="card">
-      <div class="ch"><div><h3>Utilization, memory and power per GPU</h3><div class="sub small">Average per time slot; hover to compare the GPUs at the same moment</div></div></div>
-      <div id="metrics"></div>
-    </div>
-    <div class="card">
-      <div class="ch"><h3>Per-user summary</h3><a class="btn" id="sumcsv" href="export/summary.csv" download><span class="ar">↓</span>CSV</a></div>
-      <div class="tablewrap"><table id="usertable"></table></div>
-      <div class="note" id="tnote"></div>
-    </div>
-    <div class="card">
-      <div class="ch"><div><h3>Logger uptime</h3><div class="sub small" id="uptime-stat"></div></div><div class="legend" id="uptime-legend"></div></div>
-      <div id="uptime"></div>
-      <div class="tablewrap"><table id="outages"></table></div>
-      <div class="note" id="outnote"></div>
-    </div>
-  </div>
+  </section>
 
-  <div class="sec-h"><h2>Data</h2></div>
-  <div class="card">
-    <div class="dstats" id="dbstats"></div>
-    <div class="dl">
-      <a class="btn" id="zipbtn" href="export/all.zip" download><span class="ar">↓</span><span>Download all data (.zip)</span></a>
+  <section data-fold="data">
+    <div class="sec-h"><h2><button class="tog" aria-expanded="true"><span class="chev"></span>Data</button></h2></div>
+    <div class="fold card">
+      <div class="dstats" id="dbstats"></div>
+      <div class="dl">
+        <a class="btn" id="zipbtn" href="export/all.zip" download><span class="ar">↓</span><span>Download all data (.zip)</span></a>
+      </div>
+      <div class="note" id="dbnote"></div>
     </div>
-    <div class="note" id="dbnote"></div>
-  </div>
+  </section>
   <footer id="foot"></footer>
 </main>
 <div id="tip" role="tooltip" hidden></div>
 <script>
 (() => {
 "use strict";
-const RANGES = ["24h", "7d", "30d", "90d"];
+const RANGES = ["4h", "24h", "7d", "30d", "90d"];
 const OTHER = "\u0000other";
 let range = RANGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "7d";
 let live = null, hist = null, slots = {}, TZ = 0, mcharts = [];
@@ -1285,7 +1321,7 @@ function renderKpis(d) {
 
 function renderCols(d) {
   const box = $("#cols"); box.textContent = "";
-  $("#cols-title").textContent = "GPU-hours by user, per " + (d.kind === "hour" ? "hour" : "day");
+  $("#cols-title").textContent = "GPU-hours by user, per " + {900: "15 minutes", 3600: "hour", 86400: "day"}[d.bucket_s];
   const W = Math.max(280, box.clientWidth), H = 250, L = 40, R = 6, T = 16, B = 26;
   const pw = W - L - R, ph = H - T - B, base = T + ph;
   const cap = d.n_gpus * d.bucket_hours;
@@ -1300,11 +1336,11 @@ function renderCols(d) {
   svg.append(sv("text", {x: L - 8, y: base + 4, class: "tick", "text-anchor": "end"}, "0"));
   svg.append(sv("line", {x1: L, x2: W - R, y1: y(cap), y2: y(cap), class: "axis"}));
   svg.append(sv("text", {x: W - R, y: y(cap) - 5, class: "tick", "text-anchor": "end"},
-                `capacity: ${d.n_gpus} GPUs × ${d.bucket_hours} h`));
+                `capacity: ${d.n_gpus} GPUs × ${d.bucket_s < 3600 ? d.bucket_s / 60 + " min" : d.bucket_hours + " h"}`));
 
   const keys = seriesKeys(d), n = d.buckets.length, band = pw / n;
   const bw = Math.max(2, Math.min(24, band * 0.62));
-  const label = t => d.kind === "hour" ? fmtT(t, LONGDAY) + ", " + fmtT(t, HM) + "–" + fmtT(t + 3600, HM) : fmtT(t, LONGDAY);
+  const label = t => d.bucket_s < 86400 ? fmtT(t, LONGDAY) + ", " + fmtT(t, HM) + "–" + fmtT(t + d.bucket_s, HM) : fmtT(t, LONGDAY);
   d.buckets.forEach((b, i) => {
     const vals = aggregate(b.users);
     const segs = keys.filter(k => vals[k] > 0);
@@ -1331,10 +1367,8 @@ function renderCols(d) {
     });
   });
   svg.append(sv("line", {x1: L, x2: W - R, y1: base, y2: base, class: "axis"}));
-  const need = d.kind === "hour" ? 46 : (n <= 14 ? 50 : 44);
-  const strides = d.kind === "hour" ? [1, 2, 3, 4, 6, 12] : [1, 2, 7, 14, 30];
+  const {strides, fmt: tickFmt, need} = axisSpec(d);
   const stride = strides.find(s => s * band >= need) || strides[strides.length - 1];
-  const tickFmt = d.kind === "hour" ? HM : (n <= 14 ? DAY : DATE);
   d.buckets.forEach((b, i) => {
     if ((n - 1 - i) % stride) return;
     const cx = L + (i + 0.5) * band, nearEnd = cx > W - R - 22;   // keep the last label inside the chart
@@ -1343,12 +1377,18 @@ function renderCols(d) {
   box.append(svg);
 }
 
+// how to label a time axis: label every Nth bucket (the first N that fits), in this format
+function axisSpec(d) {
+  if (d.bucket_s === 900) return {strides: [1, 2, 4, 8, 16], fmt: HM, need: 46};
+  if (d.bucket_s === 3600) return {strides: [1, 2, 3, 4, 6, 12], fmt: HM, need: 46};
+  const short = d.buckets.length <= 14;
+  return {strides: [1, 2, 7, 14, 30], fmt: short ? DAY : DATE, need: short ? 50 : 44};
+}
 // tick positions along a time axis pw pixels wide, at column-bucket boundaries
 function timeTicks(d, pw, minPx) {
   const n = d.buckets.length, span = d.end - d.since;
-  const strides = d.kind === "hour" ? [1, 2, 3, 4, 6, 12] : [1, 2, 7, 14, 30];
+  const {strides, fmt} = axisSpec(d);
   const stride = strides.find(s => s * pw / n >= minPx) || strides[strides.length - 1];
-  const fmt = d.kind === "hour" ? HM : (n <= 14 ? DAY : DATE);
   const out = [];
   d.buckets.forEach((b, i) => {
     if ((n - 1 - i) % stride) return;
@@ -1556,32 +1596,25 @@ function renderData(d) {
               "process sample and logger event as CSV files (times in the node's local time).");
 }
 
-// ---- utilization as a share of the theoretical maximum, every GPU x every range
-const RANGE_LABEL = {"24h": "Last 24 hours", "7d": "Last 7 days", "30d": "Last 30 days", "90d": "Last 90 days"};
+// ---- utilization as a share of the theoretical maximum, all GPUs together, for every range
+const RANGE_LABEL = {"4h": "Last 4 hours", "24h": "Last 24 hours", "7d": "Last 7 days", "30d": "Last 30 days", "90d": "Last 90 days"};
 function renderPeriods(d) {
-  const p = d.periods, t = $("#periods"); t.textContent = "";
-  t.append(el("thead", null, el("tr", null, el("th", null, "GPU"), ...p.ranges.map(r => el("th", "num", RANGE_LABEL[r])))));
-  const body = el("tbody");
-  const row = (name, g, cls) => {
-    const tr = el("tr", cls, el("td", null, name));
-    for (const r of p.ranges) {
-      const v = g.util[r], logged = g.logged[r];
-      const fill = el("span"); fill.style.width = (v == null ? 0 : Math.max(0, Math.min(100, v))) + "%";
-      const td = el("td", "num", el("span", "pv", v == null ? "–" : Math.round(v) + "%"), el("span", "pbar", fill),
-                    v != null && logged < 0.95 ? el("span", "pl2", `${Math.round(logged * 100)}% of the period logged`) : null);
-      td.title = v == null ? "No samples in this period" :
-        `${name}, ${RANGE_LABEL[r].toLowerCase()}: ${v.toFixed(1)}% of the theoretical maximum (${Math.round(logged * 100)}% of the period logged)`;
-      tr.append(td);
-    }
-    body.append(tr);
-  };
-  for (const g of p.gpus) row("GPU " + g.index, g);
-  if (p.gpus.length > 1) row("All GPUs", p.all, "all");
-  if (!p.gpus.length) { const td = el("td", "dim", "No samples yet."); td.colSpan = p.ranges.length + 1; body.append(el("tr", null, td)); }
-  t.append(body);
-  $("#pnote").textContent = "Average GPU utilization as reported by nvidia-smi (the share of time a kernel was running, not FLOPs), " +
-    "as a percentage of the theoretical maximum: the GPU at 100% for the whole period. Only time when the logger was " +
-    "recording counts; a cell says so when that is less than 95% of the period. Periods match the History ranges, which start at the beginning of an hour or day.";
+  const p = d.periods, a = p.all, box = $("#periods"); box.textContent = "";
+  const n = p.gpus.length;
+  $("#maxsub").textContent = n ? `all ${n} GPU${n > 1 ? "s" : ""}` : "";
+  for (const r of p.ranges) {
+    const v = a.util[r], logged = a.logged[r];
+    const fill = el("span"); fill.style.width = (v == null ? 0 : Math.max(0, Math.min(100, v))) + "%";
+    const bar = el("span", "pbar", fill);
+    bar.setAttribute("role", "meter"); bar.setAttribute("aria-label", RANGE_LABEL[r]);
+    bar.setAttribute("aria-valuemin", 0); bar.setAttribute("aria-valuemax", 100); bar.setAttribute("aria-valuenow", v == null ? 0 : Math.round(v));
+    box.append(el("div", "card tile", el("div", "lab", RANGE_LABEL[r]), el("div", "val", v == null ? "–" : Math.round(v) + "%"), bar,
+      el("div", "sub", v == null ? "No samples yet" :
+                       logged < 0.95 ? `${Math.round(logged * 100)}% of the period logged` : "of every GPU at 100%")));
+  }
+  $("#pnote").textContent = "Average utilization across all GPUs, as reported by nvidia-smi (the share of time a kernel was running, not FLOPs), " +
+    "as a percentage of the theoretical maximum: every GPU at 100% for the whole period. Only time when the logger was recording counts; " +
+    "a tile says so when that is less than 95% of the period. Periods match the History ranges, which start at the beginning of a quarter hour, hour or day.";
 }
 
 // ---- logger uptime: when samples were recorded, and why they were not
@@ -1693,7 +1726,27 @@ $("#zipbtn").addEventListener("click", () => {
   setTimeout(() => { label.textContent = "Download all data (.zip)"; }, 10000);
 });
 let rt;
-addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { if (hist) { renderCols(hist); renderTimeline(hist); renderMetrics(hist); renderUptime(hist); } }, 150); });
+function redraw() { if (hist) { renderCols(hist); renderTimeline(hist); renderMetrics(hist); renderUptime(hist); } }
+addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(redraw, 150); });
+
+// ---- folding sections and cards; which ones are folded is remembered in this browser
+const FOLD_KEY = "gpu-dash:folded";
+let folded = new Set();
+try { folded = new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || "[]")); } catch (e) { /* storage blocked */ }
+function setFold(box, on) {
+  box.classList.toggle("collapsed", on);
+  box.querySelector(".tog").setAttribute("aria-expanded", String(!on));
+}
+for (const box of document.querySelectorAll("[data-fold]")) {
+  setFold(box, folded.has(box.dataset.fold));
+  box.querySelector(".tog").addEventListener("click", () => {
+    const on = !box.classList.contains("collapsed");
+    setFold(box, on);
+    if (on) folded.add(box.dataset.fold); else folded.delete(box.dataset.fold);
+    try { localStorage.setItem(FOLD_KEY, JSON.stringify([...folded])); } catch (e) { /* storage blocked */ }
+    if (!on) { tipHide(); redraw(); }   // charts drawn while folded had no width to fill
+  });
+}
 loadLive(); loadHist();
 setInterval(loadLive, 10000);
 setInterval(loadHist, 60000);

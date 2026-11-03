@@ -11,9 +11,9 @@ library, and `nvidia-smi`.
 - **Right now**: each GPU is marked free, in use, shared or "held, idle". The cards show
   utilization, used and free memory, temperature, and power against the power limit, plus
   every process with its user, memory, its own compute (SM) use, running time and command.
-- **Utilization of theoretical maximum**: one number per GPU, and for all GPUs together,
-  for the last 24 hours, 7, 30 and 90 days.
-- **History** for the last 24 hours, 7, 30 or 90 days:
+- **Utilization of theoretical maximum**: one number for all GPUs together, for each of
+  the last 4 hours, 24 hours, 7, 30 and 90 days.
+- **History** for the last 4 hours, 24 hours, 7, 30 or 90 days:
   - GPU-hours per user over time.
   - Who held each GPU when, including sharing.
   - Utilization, memory and power per GPU.
@@ -23,6 +23,9 @@ library, and `nvidia-smi`.
     cause.
 - **Data**: database size, sample counts, growth per month, and downloads of everything
   recorded.
+
+Every section and chart can be folded away by clicking its title. Your browser remembers
+which ones you folded.
 
 ## Setup (no sudo)
 
@@ -95,7 +98,7 @@ export GPU_DASH_DIR=/path/to/scratch/gpu-dash
 | Command | What it does |
 |---|---|
 | `gpu_dash.py` | Records a sample every 60 s and serves the dashboard on `127.0.0.1:8050` |
-| `gpu_dash.py --report 7d` | Prints the per-user summary, utilization per GPU and period, and logger uptime, for `24h`, `7d`, `30d` or `90d` |
+| `gpu_dash.py --report 7d` | Prints the per-user summary, utilization of the theoretical maximum and logger uptime, for `4h`, `24h`, `7d`, `30d` or `90d` |
 | `gpu_dash.py --report 30d --csv` | Prints the per-user summary as CSV |
 | `gpu_dash.py --export DIR` | Writes the same zip as **Download all data** into `DIR` |
 
@@ -127,13 +130,14 @@ For scripts, each file is also available on its own: `/export/usage.sqlite`,
 
 ## Utilization of theoretical maximum
 
-For each GPU and each period, this is the GPU's average utilization as a percentage of
-the theoretical maximum, meaning the GPU at 100% for the whole period. The utilization
+For each period, this is the average utilization across all GPUs as a percentage of
+the theoretical maximum, meaning every GPU at 100% for the whole period. The utilization
 is the figure `nvidia-smi` reports: the share of time a kernel was running on the GPU,
 not a measure of FLOPs. Only time when the logger was recording counts. When that is
-less than the whole period, for example in the first days after setup, the cell shows
-how much of the period was logged. The periods match the History ranges: the last 24
-hours start at the beginning of an hour, and the 7, 30 and 90 days start at midnight.
+less than 95% of the period, for example in the first days after setup, the tile shows
+how much of the period was logged. The periods match the History ranges: the last
+4 hours start at a quarter hour, the last 24 hours at the beginning of an hour, and the
+7, 30 and 90 days at midnight.
 
 ## Logger uptime
 

@@ -239,6 +239,16 @@ class UptimeAndUtilization(Base):
         self.assertEqual(rows, [("error", "nvidia-smi failed: driver gone")] * 2)
         self.assertEqual(self.store.con.execute("SELECT COUNT(*) FROM gpu").fetchone()[0], 1)
 
+    def test_four_hour_range_uses_quarter_hour_columns(self):
+        self.fill(60, lambda i: [gpu(0, util=50, procs=[proc("alice", 1000, sm=50)])])
+        d = self.app._compute_history("4h")
+        self.assertEqual((d["bucket_s"], len(d["buckets"])), (900, 16))
+        self.assertEqual({b["t"] - a["t"] for a, b in zip(d["buckets"], d["buckets"][1:])}, {900})
+        self.assertAlmostEqual(sum(sum(b["users"].values()) for b in d["buckets"]), 1.0, places=3)
+        self.assertTrue(all(sum(b["users"].values()) <= 0.25 + 1e-9 for b in d["buckets"]))
+        self.assertEqual(len(d["timeline"][0]["cells"]), 120)                # 2-minute slots
+        self.assertAlmostEqual(d["periods"]["all"]["util"]["4h"], 50)
+
     def test_utilization_of_theoretical_maximum_per_gpu_and_range(self):
         # GPU 0 at 50% for an hour; GPU 1 at 100% for half an hour and idle for the other half
         self.fill(60, lambda i: [gpu(0, util=50), gpu(1, util=100 if i < 30 else 0)])
