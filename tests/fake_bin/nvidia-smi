@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Stand-in for nvidia-smi so the tests and the demo run without GPUs (3 x A100 80GB).
+
+Environment:
+  FAKE_SMI_PROCS     comma-separated gpu:pid:mem_mib[:sm_pct] entries, e.g. "0:1234:20480:85"
+  FAKE_SMI_BASIC     act like an old driver that cannot report power or temperature
+  FAKE_SMI_NO_PMON   make `nvidia-smi pmon` fail
+"""
+import os
+import sys
+
+GPUS = [(0, "GPU-0a1b2c3d-0000"), (1, "GPU-0a1b2c3d-1111"), (2, "GPU-0a1b2c3d-2222")]
+NAME = "NVIDIA A100-SXM4-80GB"
+
+
+def procs():
+    out = []
+    for item in filter(None, os.environ.get("FAKE_SMI_PROCS", "").split(",")):
+        parts = item.split(":")
+        out.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3] if len(parts) > 3 else "-"))
+    return out
+
+
+def gpu_values(index, uuid):
+    mine = [p for p in procs() if p[0] == index]
+    util = min(100, sum(int(p[3]) for p in mine if p[3] != "-"))
+    return {"index": index, "uuid": uuid, "name": NAME, "utilization.gpu": util,
+            "memory.used": sum(p[2] for p in mine) + 4, "memory.total": 81920,
+            "temperature.gpu": 31 + util // 3, "power.draw": "%.2f" % (58 + util * 3.3),
+            "power.limit": "400.00"}
+
+
+args = sys.argv[1:]
+query = next((a for a in args if a.startswith("--query-")), "")
+
+if args[:1] == ["pmon"]:
+    if os.environ.get("FAKE_SMI_NO_PMON"):
+        sys.exit("Failed to initialize process monitoring")
+    print("# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command")
+    print("# Idx           #    C/G      %      %      %      %      %      %    name")
+    for index, _ in GPUS:
+        mine = [p for p in procs() if p[0] == index]
+        if not mine:
+            print("    %d          -     -      -      -      -      -      -      -    -" % index)
+        for gpu, pid, _, sm in mine:
+            print("    %d %10d     C %6s %6s      -      -      -      -    python" % (gpu, pid, sm, "-"))
+elif query.startswith("--query-gpu="):
+    fields = query.split("=", 1)[1].split(",")
+    if os.environ.get("FAKE_SMI_BASIC") and any(f.startswith(("power", "temperature")) for f in fields):
+        print('Field "power.draw" is not a valid field to query.')
+        sys.exit(2)
+    for index, uuid in GPUS:
+        values = gpu_values(index, uuid)
+        print(", ".join(str(values[f]) for f in fields))
+elif query.startswith("--query-compute-apps="):
+    uuids = dict(GPUS)
+    for gpu, pid, mem, _ in procs():
+        print("%s, %d, %d" % (uuids[gpu], pid, mem))
+else:
+    sys.exit("fake nvidia-smi: unsupported arguments %s" % args)

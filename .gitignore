@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# local data and exports
+*.db
+*.db-journal
+*.sqlite
+*.lock
+*.log
